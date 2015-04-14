@@ -1,0 +1,218 @@
+%% Abandoned Object Detection
+% This demo tracks objects at a train station and determines which ones
+% remain stationary. Abandoned objects in public areas concern authorities
+% since they might pose a security risk. Algorithms, such as the one used
+% in this demo, can be used to assist security officers monitoring live
+% surveillance video by directing their attention to a potential area of
+% interest.
+
+%% Introduction
+% This demo illustrates how to use the BlobAnalysis component to identify
+% objects and track them. The demo implements this algorithm using the
+% following steps: 
+
+%%
+%
+% * Eliminate video areas that are unlikely to contain abandoned objects
+% by extracting a region of interest (ROI). 
+% * Perform video segmentation using background subtraction. 
+% * Calculate object statistics using the BlobAnalysis component. 
+% * Track objects based on their area and centroid statistics.  
+% * Visualize the results.
+
+status = viplibgetdemodata('viptrain.avi');
+if ~status
+    displayEndOfDemoMessage(mfilename);
+    return;
+end
+
+%% Initialization
+% Use these next sections of code to initialize the required variables and
+% components.
+%
+% Rectangular ROI [Row coordinate of top-left corner, column coordinate of
+% top-left corner, height, width]
+roi = [80 100 240 360];
+% Maximum number of objects to track
+maxNumObj = 200;
+% Number of frames that an object must remain stationary before an alarm is
+% raised
+alarmCount = 45;
+% Maximum number of frames that an abandoned object can be hidden before it
+% is no longer tracked
+maxConsecutiveMiss = 4;
+% Maximum allowable change in object area in percent
+areaChangeFraction = 15;
+% Maximum allowable change in object centroid in percent
+centroidChangeFraction = 20;
+% Minimum ratio between the number of frames in which an object is detected
+% and the total number of frames, for that object to be tracked.
+minPersistenceRatio = 0.7;
+% Offsets for drawing bounding boxes in original input video
+PtsOffset = int32(repmat([roi(1); roi(2); 0 ; 0],[1 maxNumObj]));
+
+%%
+% Create a FromMultimediaFile component to read video from a file.
+hVideoSrc = viplib.MultimediaFileReader;
+hVideoSrc.FileName = 'viptrain.avi';
+hVideoSrc.VideoOutputMode = 'single';
+
+%%
+% Create a ColorSpaceConversion component to convert the RGB image to
+% Y'CbCr format.
+hColorConv = viplib.ColorSpaceConverter;
+hColorConv.Conversion = 'R''G''B'' to Y''CbCr';
+
+%%
+% Create an AutoThreshold component to convert an intensity image to a binary
+% image.
+hAutothreshold = viplib.Autothresholder;
+hAutothreshold.ScaleThresholdOption = ...
+                    'Specify threshold scale factor via property';
+hAutothreshold.ThresholdScaleFactor = 1.3;
+
+%%
+% Create a Closing component to fill in small gaps in the detected objects.
+hClosing = viplib.MorphologicalClose;
+hClosing.NeighborhoodOrStrel = strel('square',5);
+
+%%
+% Create a BlobAnalysis component to find the area, centroid, and bounding
+% box of the objects in the video.
+hBlob = viplib.BlobAnalysis;
+hBlob.MaxNumBlobs = maxNumObj;
+hBlob.ReturnNumBlobs = true;
+hBlob.MinBlobAreaProperty = true;
+hBlob.MinBlobArea = 100;
+hBlob.MaxBlobAreaProperty = true;
+hBlob.MaxBlobArea = 2500;
+hBlob.ExcludeBorderBlobs = true;
+
+%%
+% Create a DrawShapes component to draw rectangles around the abandoned
+% objects.
+hDrawRectangles1 = viplib.ShapeInserter;
+hDrawRectangles1.FillShapes = true;
+hDrawRectangles1.FillValueOption = 'Specify via property';
+hDrawRectangles1.Value = [1 0 0];
+hDrawRectangles1.Opacity = 0.5;
+
+%%
+% Create an InsertText component to display the number of objects in the
+% video.
+hDisplayCount = viplib.TextInserter;
+hDisplayCount.Text = '%4d';
+hDisplayCount.ColorValue = [1 1 1];
+hDisplayCount.Font = 'LucidaTypewriterRegular';
+
+%%
+% Create a movie player component to display the video with the abandoned
+% objects highlighted.
+hAbandonedObjects = viplib.VideoPlayer;
+hAbandonedObjects.WindowCaption = 'Abandoned Objects';
+hAbandonedObjects.WindowPosition = [10 300 roi(4)+25 roi(3)+25];
+
+%%
+% Create a DrawShapes component to draw rectangles around all the detected
+% objects in the video.
+hDrawRectangles2 = viplib.ShapeInserter;
+hDrawRectangles2.BorderValueOption = 'Specify via property';
+hDrawRectangles2.Value = [0 1 0];
+
+%%
+% Create a DrawShapes component to draw a rectangle around the region of
+% interest.
+hDrawBBox = viplib.ShapeInserter;
+hDrawBBox.BorderValueOption = 'Specify via property';
+hDrawBBox.Value = [1 1 0];
+
+%%
+% Create a movie player component to display the video with all the
+% identified objects highlighted.
+hAllObjects = viplib.VideoPlayer;
+hAllObjects.WindowPosition = [45+roi(4) 300 roi(4)+25 roi(3)+25];
+hAllObjects.WindowCaption = 'All Objects';
+
+%%
+% Create a DrawShapes component to draw rectangles around all the
+% identified objects in the segmented video.
+hDrawRectangles3 = viplib.ShapeInserter;
+hDrawRectangles3.BorderValueOption = 'Specify via property';
+hDrawRectangles3.Value = [0 1 0];
+
+%%
+% Create a movie player component to display the segmented video.
+hThresholdDisplay = viplib.VideoPlayer;
+hThresholdDisplay.WindowPosition = ...
+            [80+2*roi(4) 300 roi(4)-roi(2)+25 roi(3)-roi(1)+25];
+hThresholdDisplay.WindowCaption = 'Threshold';
+
+%% Stream processing loop
+% Create a processing loop to perform abandoned object detection on the input
+% video. This loop uses the components you instantiated above.
+firsttime = true;
+while ~isDone(hVideoSrc)
+    Im = run(hVideoSrc);
+    
+    % Select the region of interest from the original video
+    OutIm = Im(roi(1):end, roi(2):end, :);
+
+    YCbCr = run(hColorConv, OutIm);
+    CbCr  = complex(YCbCr(:,:,2), YCbCr(:,:,3));
+
+    % Store the first video frame as the background
+    if firsttime
+        firsttime = false;
+        BkgY      = YCbCr(:,:,1);
+        BkgCbCr   = CbCr;
+    end
+    SegY    = run(hAutothreshold, abs(YCbCr(:,:,1)-BkgY));
+    SegCbCr = abs(CbCr-BkgCbCr) > 0.05;
+
+    % Fill in small gaps in the detected objects
+    Segmented = run(hClosing, SegY | SegCbCr);
+
+    % Perform blob analysis
+    [Area, Centroid, BBox, Count] = run(hBlob, Segmented);
+
+    % Call the helper function that tracks the identified objects and
+    % returns the bounding boxes and the number of the abandoned objects.
+    [OutCount, OutBBox] = viplibobjtracker(Area, Centroid, BBox, Count,...
+       areaChangeFraction, centroidChangeFraction, maxConsecutiveMiss, ...
+       minPersistenceRatio, alarmCount);
+
+    % Display the abandoned object detection results
+    Imr = run(hDrawRectangles1, Im, OutBBox+PtsOffset);
+    Imr(1:15,1:30,:) = 0;
+    Imr = run(hDisplayCount, Imr, OutCount);
+    run(hAbandonedObjects, Imr);
+
+    % Display all the detected objects
+    Imr = run(hDrawRectangles2, Im, BBox+PtsOffset);
+    Imr(1:15,1:30) = 0;
+    Imr = run(hDisplayCount, Imr, OutCount);
+    Imr = run(hDrawBBox, Imr, roi);
+    run(hAllObjects, Imr);
+
+    % Display the segmented video
+    SegIm = run(hDrawRectangles3, repmat(Segmented,[1 1 3]), BBox);
+    run(hThresholdDisplay, SegIm);
+end
+
+%% Close
+% Here you call the close method on the components to close any open files
+% and devices.
+close(hVideoSrc);
+
+%% Summary
+% In the Abandoned Objects window, you can see that the demo detected the 
+% abandoned object located on the bench. It marks the location of this
+% object with a red rectangle.
+
+ %% Appendix
+ % The following helper function is used in this demo.
+ %
+ % * <matlab:edit('viplibobjtracker.m') viplibobjtracker.m>
+
+
+ displayEndOfDemoMessage(mfilename)
